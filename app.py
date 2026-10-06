@@ -6,6 +6,7 @@ Run with --once for a single headless pass (cron / Task Scheduler).
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -280,6 +281,17 @@ class App(ctk.CTk):
                 note += f". Last upload failed: {e['ia_error'][:120]}"
             ctk.CTkLabel(info, text=note, font=font(12), anchor="w", wraplength=440, justify="left",
                          text_color=C["rec"] if ia_status == "failed" else C["muted"]).pack(anchor="w")
+            found_elsewhere = e.get("ia_found") or []
+            if ia_status != "uploaded" and (found_elsewhere or e.get("wayback")):
+                links = ctk.CTkFrame(info, fg_color="transparent")
+                links.pack(anchor="w", pady=(4, 0))
+                if found_elsewhere:
+                    n = len(found_elsewhere)
+                    self._link(links, f"Already archived by someone else ({n})",
+                               found_elsewhere[0]["url"] if n == 1 else
+                               f"https://archive.org/search?query=%22{vid}%22").pack(side="left", padx=(0, 12))
+                if e.get("wayback"):
+                    self._link(links, "Wayback Machine snapshot", e["wayback"]).pack(side="left")
 
             acts = ctk.CTkFrame(row, fg_color="transparent")
             acts.grid(row=0, column=1, sticky="e", padx=14)
@@ -290,11 +302,39 @@ class App(ctk.CTk):
                 ctk.CTkButton(acts, text="Uploading...", state="disabled", width=150, height=34, corner_radius=8,
                               font=font(13), fg_color=C["line"], text_color=C["muted"]).pack(side="left", padx=4)
             else:
-                ctk.CTkButton(acts, text="Retry upload" if ia_status == "failed" else "Upload to Internet Archive",
+                ctk.CTkButton(acts, text="Retry upload" if ia_status == "failed" else "Review and upload",
                               height=34, corner_radius=8, font=font(13, "bold"), fg_color=C["rec"],
                               hover_color=C["rec_hov"], text_color="#FFFFFF",
                               command=lambda v=vid: self.upload_one(v)).pack(side="left", padx=4)
+            if ia_status != "uploaded":
+                self._ghost_small(acts, "Find copies", lambda v=vid: self.find_copies(v)).pack(side="left", padx=4)
             self._ghost_small(acts, "Show file", lambda v=vid: self.show_file(v)).pack(side="left", padx=4)
+
+    def _link(self, parent, text, url):
+        lab = ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=FAMILY, size=12, underline=True)
+                           if FAMILY else ctk.CTkFont(size=12, underline=True), text_color=C["text"], cursor="hand2")
+        lab.bind("<Button-1>", lambda _e: webbrowser.open(url))
+        return lab
+
+    def find_copies(self, vid):
+        def go():
+            title = load_library().get(vid, {}).get("title", vid)
+            self.log(f"Searching for existing copies of {title}...")
+            copies = lostmedia.find_existing_copies(vid)
+            others = lostmedia.save_copies(vid, copies)
+            if copies.get("exact"):
+                self.log(f"Already on Internet Archive: {lostmedia.ia_url(vid)}")
+            elif others:
+                self.log(f"Found {len(others)} cop{'y' if len(others) == 1 else 'ies'} on Internet Archive: "
+                         + ", ".join(i["url"] for i in others[:3]))
+            else:
+                self.log("No copies found on Internet Archive.")
+            if copies.get("wayback"):
+                self.log(f"Wayback Machine snapshot: {copies['wayback']}")
+            if copies["errors"]:
+                self.log("Couldn't reach: " + ", ".join(copies["errors"]) + ". Try again later.")
+            self.after(0, self.refresh_stats)
+        threading.Thread(target=go, daemon=True).start()
 
     def _removed_check_due(self):
         st = load_state().get("last_removed_check")
@@ -325,7 +365,6 @@ class App(ctk.CTk):
             threading.Thread(target=self._run_removed_check, args=(cfg, threading.Event()), daemon=True).start()
 
     def upload_one(self, vid):
-        from tkinter import messagebox
         cfg = self._collect(quiet=True)
         if not cfg:
             return
@@ -333,19 +372,52 @@ class App(ctk.CTk):
             self.show("Settings")
             self.save_note.configure(text="Add your Internet Archive keys first.", text_color=C["rec"])
             return
-        title = load_library().get(vid, {}).get("title", vid)
-        if not messagebox.askyesno("Upload to Internet Archive",
-                                   f"Upload \"{title}\" to Internet Archive?\n\n"
-                                   f"It will be public at {lostmedia.ia_url(vid)}\n\n"
-                                   "Only upload videos you have the right to share."):
+        if getattr(self, "_preparing", None) == vid:
             return
+        self._preparing = vid
+        self.log("Getting the video ready for review...")
+
+        def prepare():
+            # Slow parts (archive.org lookup, cloud download, frame grab) happen off the main thread.
+            try:
+                e = load_library().get(vid) or {}
+                self.log("Searching Internet Archive and the Wayback Machine for existing copies...")
+                copies = lostmedia.find_existing_copies(vid)
+                lostmedia.save_copies(vid, copies)
+                if copies.get("exact"):
+                    self.log(f"Already on Internet Archive: {e.get('title', vid)}  {lostmedia.ia_url(vid)}")
+                    self.after(0, self.refresh_stats)
+                    return
+                others = len(copies["items"])
+                self.log(f"Found {others} existing cop{'y' if others == 1 else 'ies'} on Internet Archive."
+                         if others else "No existing copies found on Internet Archive.")
+                path, is_temp = lostmedia.locate_file(vid, cfg, self.log)
+                if not path:
+                    self.log(f"ERROR: can't find the saved file for {e.get('title', vid)}.")
+                    return
+                frame = lostmedia.preview_frame(path, e.get("duration"))
+                draft = lostmedia.draft_metadata(vid, e)
+                self.after(0, lambda: UploadPreview(self, vid, e, path, is_temp, frame, draft, cfg, copies))
+                self.after(0, self.refresh_stats)
+            except Exception as ex:
+                self.log(f"ERROR: {ex}")
+            finally:
+                self._preparing = None
+        threading.Thread(target=prepare, daemon=True).start()
+
+    def start_upload(self, vid, cfg, draft, path, is_temp):
+        from core import update_entry
+        update_entry(vid, ia_draft=draft)  # keep edits for a retry
 
         def go():
             try:
-                lostmedia.upload_to_ia(vid, cfg, self.log)
-            except Exception as e:
-                self.log(f"ERROR: {e}")
-            self.after(0, self.refresh_stats)
+                lostmedia.upload_to_ia(vid, cfg, self.log, draft=draft, file_path=path)
+            except Exception as ex:
+                self.log(f"ERROR: {ex}")
+            finally:
+                if is_temp:
+                    lostmedia.discard_temp(path)
+                self.after(0, self.refresh_stats)
         threading.Thread(target=go, daemon=True).start()
         self.after(400, self._render_removed)
 
@@ -471,8 +543,9 @@ class App(ctk.CTk):
         field(s, "Get your keys", "Sign in to archive.org, then copy both keys from this page.",
               lambda p: self._ghost_small(p, "Open archive.org",
                                           lambda: webbrowser.open("https://archive.org/account/s3.php")))
-        field(s, "When a saved video is removed", "Uploads are public. Only upload videos you have the right to share.",
-              lambda p: ctk.CTkSegmentedButton(p, values=["Ask me", "Upload automatically"], variable=var("ia_mode"),
+        field(s, "Before uploading", "Review first shows the video and every detail that will be public, "
+              "so you can edit or cancel. Skip review uploads removed videos automatically.",
+              lambda p: ctk.CTkSegmentedButton(p, values=["Review first", "Skip review"], variable=var("ia_mode"),
                                                selected_color=C["rec"], selected_hover_color=C["rec_hov"]))
         field(s, "Check for removed videos", "Once a day while watching.", switch("removed_check_daily"))
 
@@ -801,6 +874,200 @@ class App(ctk.CTk):
             if not messagebox.askyesno("Quit", "Quit and stop saving new videos?"):
                 return
         self.stop_event.set()
+        self.destroy()
+
+
+# ---------------------------------------------------------------- upload review window
+class UploadPreview(ctk.CTkToplevel):
+    """Shows the video and everything that will be public, and lets the user edit or cancel."""
+
+    def __init__(self, app, vid, entry, path, is_temp, frame, draft, cfg, copies=None):
+        super().__init__(app)
+        self.app, self.vid, self.path, self.is_temp, self.frame, self.cfg = app, vid, Path(path), is_temp, frame, cfg
+        self.draft = draft
+        self.done = False
+        self.title("Review before uploading")
+        self.geometry("660x780")
+        self.minsize(560, 560)
+        self.configure(fg_color=C["bg"])
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 4))
+        ctk.CTkLabel(head, text="Review before uploading", font=font(22, "bold"), text_color=C["text"]).pack(anchor="w")
+        ctk.CTkLabel(head, text="Everything below will be public on archive.org. Check the video and edit "
+                                "anything you don't want shared.", font=font(13), text_color=C["muted"],
+                     wraplength=600, justify="left").pack(anchor="w")
+
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(8, 0))
+        body.grid_columnconfigure(0, weight=1)
+        r = 0
+
+        # -- existing copies found before uploading
+        copies = copies or {"items": [], "wayback": None, "errors": []}
+        found = copies.get("items") or []
+        has_any = bool(found or copies.get("wayback"))
+        box = ctk.CTkFrame(body, fg_color=C["surface"], corner_radius=14, border_width=1,
+                           border_color=C["amber"] if found else C["line"])
+        box.grid(row=r, column=0, sticky="ew", padx=8, pady=(0, 14)); r += 1
+        if found:
+            msg = (f"This video may already be on Internet Archive ({len(found)} "
+                   f"match{'' if len(found) == 1 else 'es'}). Check before uploading a duplicate. "
+                   "Upload anyway if yours is better quality or theirs is incomplete.")
+        elif copies.get("wayback"):
+            msg = "Not found on Internet Archive. The YouTube page was saved in the Wayback Machine, but the video usually isn't."
+        elif copies.get("errors"):
+            msg = "Couldn't finish checking for existing copies (" + ", ".join(copies["errors"]) + ")."
+        else:
+            msg = "No existing copies found on Internet Archive or the Wayback Machine."
+        ctk.CTkLabel(box, text=msg, font=font(13, "bold") if found else font(13),
+                     text_color=C["text"] if has_any else C["muted"], wraplength=580, justify="left").pack(
+            anchor="w", padx=16, pady=(12, 6 if has_any else 12))
+        for item in found[:6]:
+            app._link(box, item["title"][:90], item["url"]).pack(anchor="w", padx=16, pady=1)
+        if len(found) > 6:
+            app._link(box, f"See all {len(found)} results",
+                      f"https://archive.org/search?query=%22{vid}%22").pack(anchor="w", padx=16, pady=1)
+        if copies.get("wayback"):
+            app._link(box, "Wayback Machine snapshot", copies["wayback"]).pack(anchor="w", padx=16, pady=1)
+        if has_any:
+            ctk.CTkFrame(box, height=10, fg_color="transparent").pack()
+
+        # -- the video itself
+        card = ctk.CTkFrame(body, fg_color=C["surface"], corner_radius=14, border_width=1, border_color=C["line"])
+        card.grid(row=r, column=0, sticky="ew", padx=8, pady=(0, 14)); r += 1
+        card.grid_columnconfigure(0, weight=1)
+        img = self._load_frame()
+        if img is not None:
+            ctk.CTkLabel(card, text="", image=img).grid(row=0, column=0, padx=16, pady=(16, 8))
+        else:
+            ctk.CTkLabel(card, text="No preview image" + (" (audio only)" if entry.get("audio_only") else ""),
+                         font=font(13), text_color=C["muted"], height=80).grid(row=0, column=0, padx=16, pady=(16, 8))
+        size = self.path.stat().st_size if self.path.exists() else 0
+        dur = entry.get("duration")
+        length = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur else "Unknown length"
+        info = f"{self.path.name}\n{size / 1e6:.0f} MB, {length}"
+        if is_temp:
+            info += "\nDownloaded back from your cloud storage for this upload."
+        ctk.CTkLabel(card, text=info, font=font(12), text_color=C["muted"], justify="left",
+                     wraplength=560).grid(row=1, column=0, sticky="w", padx=16)
+        ctk.CTkButton(card, text="Play the full video", height=34, corner_radius=8, font=font(13),
+                      fg_color="transparent", border_width=1, border_color=C["line"], hover_color=C["navsel"],
+                      text_color=C["text"], command=lambda: app._open(self.path)).grid(
+            row=2, column=0, sticky="w", padx=16, pady=(8, 16))
+
+        # -- editable metadata
+        self.vars = {}
+
+        def text_field(label, key, hint=None):
+            nonlocal r
+            ctk.CTkLabel(body, text=label, font=font(14), text_color=C["text"]).grid(row=r, column=0, sticky="w", padx=10); r += 1
+            if hint:
+                ctk.CTkLabel(body, text=hint, font=font(12), text_color=C["muted"]).grid(row=r, column=0, sticky="w", padx=10); r += 1
+            v = tk.StringVar(value=draft.get(key, "") if key != "subject" else ", ".join(draft.get("subject", [])))
+            ctk.CTkEntry(body, textvariable=v, height=34, border_color=C["line"]).grid(
+                row=r, column=0, sticky="ew", padx=8, pady=(4, 12)); r += 1
+            self.vars[key] = v
+
+        text_field("Title", "title")
+        text_field("Creator", "creator", "Usually the original channel name.")
+        text_field("Date", "date", "YYYY-MM-DD")
+        text_field("Tags", "subject", "Separated by commas.")
+        ctk.CTkLabel(body, text="Description", font=font(14), text_color=C["text"]).grid(row=r, column=0, sticky="w", padx=10); r += 1
+        ctk.CTkLabel(body, text="Check for links, names or personal details you don't want public.",
+                     font=font(12), text_color=C["muted"]).grid(row=r, column=0, sticky="w", padx=10); r += 1
+        self.desc = ctk.CTkTextbox(body, height=170, font=font(13), fg_color=C["surface"], border_width=1,
+                                   border_color=C["line"], wrap="word")
+        self.desc.grid(row=r, column=0, sticky="ew", padx=8, pady=(4, 12)); r += 1
+        self.desc.insert("1.0", draft.get("description", ""))
+
+        # -- fixed details
+        fixed = (f"Public page: {lostmedia.ia_url(vid)}\n"
+                 f"Collection: {draft.get('collection')}  ({draft.get('mediatype')})\n"
+                 f"Original link: {draft.get('originalurl')}")
+        ctk.CTkLabel(body, text=fixed, font=font(12), text_color=C["muted"], justify="left",
+                     wraplength=580).grid(row=r, column=0, sticky="w", padx=10, pady=(0, 6)); r += 1
+
+        # -- footer
+        foot = ctk.CTkFrame(self, fg_color=C["side"], corner_radius=0)
+        foot.grid(row=2, column=0, sticky="ew")
+        foot.grid_columnconfigure(0, weight=1)
+        self.ok = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(foot, text="I've watched this and I have the right to share it publicly",
+                        variable=self.ok, onvalue=True, offvalue=False, font=font(13), text_color=C["text"],
+                        fg_color=C["rec"], hover_color=C["rec_hov"], command=self._sync).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=24, pady=(14, 8))
+        self.note = ctk.CTkLabel(foot, text="", font=font(12), text_color=C["rec"])
+        self.note.grid(row=1, column=0, sticky="w", padx=24)
+        ctk.CTkButton(foot, text="Cancel", width=100, height=38, corner_radius=19, font=font(14),
+                      fg_color="transparent", border_width=1, border_color=C["line"], hover_color=C["navsel"],
+                      text_color=C["text"], command=self.cancel).grid(row=1, column=1, padx=6, pady=(0, 16))
+        self.go_btn = ctk.CTkButton(foot, text="Upload publicly", width=150, height=38, corner_radius=19,
+                                    font=font(14, "bold"), fg_color=C["rec"], hover_color=C["rec_hov"],
+                                    text_color="#FFFFFF", state="disabled", command=self.confirm)
+        self.go_btn.grid(row=1, column=2, padx=(6, 24), pady=(0, 16))
+
+        self.after(100, self._focus)
+
+    def _focus(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _load_frame(self):
+        if not self.frame:
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(self.frame)
+            im.load()
+            w = min(520, im.width)
+            return ctk.CTkImage(light_image=im, dark_image=im, size=(w, int(im.height * w / im.width)))
+        except Exception:
+            return None
+
+    def _sync(self):
+        self.go_btn.configure(state="normal" if self.ok.get() else "disabled")
+
+    def confirm(self):
+        title = self.vars["title"].get().strip()
+        date = self.vars["date"].get().strip()
+        if not title:
+            self.note.configure(text="Add a title.")
+            return
+        if date and not re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", date):
+            self.note.configure(text="Use YYYY-MM-DD for the date, or leave it blank.")
+            return
+        draft = dict(self.draft)
+        draft.update(title=title, creator=self.vars["creator"].get().strip(), date=date,
+                     subject=[t.strip() for t in self.vars["subject"].get().split(",") if t.strip()],
+                     description=self.desc.get("1.0", "end").strip())
+        self.done = True
+        self._close()
+        self.app.start_upload(self.vid, self.cfg, draft, self.path, self.is_temp)
+
+    def cancel(self):
+        if not self.done and self.is_temp:
+            lostmedia.discard_temp(self.path)
+        if not self.done:
+            self.app.log("Upload cancelled.")
+        self._close()
+
+    def _close(self):
+        if self.frame:
+            lostmedia.discard_temp(self.frame)
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self.destroy()
 
 

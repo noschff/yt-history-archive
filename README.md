@@ -47,13 +47,16 @@ The **Removed** page checks every video you've saved and lists the ones YouTube 
 To set it up:
 1. Make a free account at archive.org.
 2. In the app, go to Settings > Internet Archive > **Open archive.org**, and copy your access key and secret key into the app.
-3. Choose **Ask me** (you click upload yourself) or **Upload automatically**.
 
-Uploads go to `archive.org/details/youtube-<video id>`, with the original title, channel, upload date, description and link. If someone already uploaded that video there, the app links to theirs instead of uploading a duplicate. If you use rclone "move" mode, the app downloads the file back from your cloud before uploading.
+**Review before uploading.** Clicking **Review and upload** opens a window showing a still from the video, a button to play the whole thing, and every detail that will be public: title, creator, date, tags and description. You can edit any of it or cancel. Nothing uploads until you tick "I've watched this and I have the right to share it publicly" and click **Upload publicly**. Your edits are kept if you need to retry.
+
+If you set **Before uploading** to **Skip review**, removed videos upload automatically with no review window. The headless `--check-removed` mode only uploads when Skip review is chosen.
+
+Uploads go to `archive.org/details/youtube-<video id>`, with the original title, channel, upload date, description and link. Before every upload the app looks for existing copies in three places: the standard `youtube-<id>` address, a search of all archive.org items for the video ID (catching uploads by other people under any name), and the Wayback Machine. If the standard address exists, it links to it and doesn't upload. If other copies turn up, the review window lists them so you can decide whether yours is worth adding. **Find copies** on the Removed page runs the same search without uploading. In Skip review mode, videos that someone else already archived are skipped rather than duplicated. If you use rclone "move" mode, the app downloads the file back from your cloud before uploading.
 
 Uploads are public. Only upload videos you have the right to share; archive.org may remove copyrighted material. Your keys are stored in plain text in `~/.yt_history_archiver/config.json`.
 
-Headless: `python core.py --check-removed` checks for removals and uploads them automatically.
+Headless: `python core.py --check-removed` checks for removals (and uploads them only if Skip review is on).
 
 ## Tips and fixes
 
@@ -65,9 +68,3 @@ Headless: `python core.py --check-removed` checks for removals and uploads them 
 - Storage: roughly 0.5–1 GB per hour of 1080p video. Use 720p, audio-only or "skip shorter than" to cut it down.
 
 Downloading YouTube videos goes against YouTube's Terms of Service; use it for your own personal archive and keep the check interval reasonable.
-
-## Credits
-
-* **Developer:** [Nolan Schleiff](https://github.com/noschff)
-* **Built With:** Claude 5.5 Opus by [Anthropic](https://anthropic.com)
-

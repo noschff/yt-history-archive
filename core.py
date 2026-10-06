@@ -54,7 +54,7 @@ DEFAULTS = {
     "rclone_mode": "copy",
     "ia_access": "",
     "ia_secret": "",
-    "ia_mode": "Ask me",
+    "ia_mode": "Review first",
     "removed_check_daily": True,
 }
 BROWSERS = ["chrome", "firefox", "edge", "brave", "safari", "chromium", "opera", "vivaldi"]
@@ -82,6 +82,8 @@ def load_config():
         cfg.update(json.loads(CONFIG_FILE.read_text()))
     except Exception:
         pass
+    # settings from older versions
+    cfg["ia_mode"] = {"Ask me": "Review first", "Upload automatically": "Skip review"}.get(cfg["ia_mode"], cfg["ia_mode"])
     return cfg
 
 
@@ -408,7 +410,8 @@ class Archiver:
 def headless(argv):
     if "--check-removed" in argv:
         import lostmedia
-        lostmedia.check_removed(load_config(), print, auto_upload=True)
+        # No window here to review uploads, so this only uploads if "Skip review" is chosen in Settings.
+        lostmedia.check_removed(load_config(), print)
         return
     if "--skip-history" in argv:
         Archiver(print).mark_history_seen(load_config())
