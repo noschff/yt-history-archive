@@ -68,3 +68,16 @@ Headless: `python core.py --check-removed` checks for removals (and uploads them
 - Storage: roughly 0.5–1 GB per hour of 1080p video. Use 720p, audio-only or "skip shorter than" to cut it down.
 
 Downloading YouTube videos goes against YouTube's Terms of Service; use it for your own personal archive and keep the check interval reasonable.
+
+## Credits
+
+Developed by **Nolan Schleiff**.
+
+Code written with the help of **Claude Opus 5.5** by [Anthropic](https://www.anthropic.com).
+
+Built on these open-source tools:
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp): video downloading
+- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter): the app interface
+- [rclone](https://rclone.org): cloud uploads
+- [internetarchive](https://github.com/jjjake/internetarchive): Internet Archive uploads
+- [FFmpeg](https://ffmpeg.org): merging video and audio
